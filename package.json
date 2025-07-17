@@ -1,6 +1,6 @@
 {
   "name": "smartlitefetch",
-  "version": "2.1.0",
+  "version": "2.1.1",
   "description": "A powerful HTTP request library with support for both node-fetch 2.x and 3.x",
   "type": "module",
   "main": "./index.js",

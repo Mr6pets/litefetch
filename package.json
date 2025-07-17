@@ -31,7 +31,9 @@
     "deploy:npm:minor": "npm run lint &&  npm version minor && npm publish",
     "deploy:npm:major": "npm run lint &&  npm version major && npm publish",
     "wind_build": "echo Building project... && if not exist dist mkdir dist && xcopy /s /e /y src\\* dist\\",
-    "build": "echo Building project... && if not exist dist mkdir dist && cpy src/**/* dist --parents"
+    "build": "echo Building project... && if not exist dist mkdir dist && cpy src/**/* dist --parents",
+    "type-check": "tsc --noEmit",
+    "build:types": "tsc --declaration --emitDeclarationOnly --outDir types"
   },
   "keywords": [
     "fetch",
@@ -58,13 +60,16 @@
   "homepage": "https://github.com/Mr6pets/smartlitefetch#readme",
   "files": [
     "src/",
-    "examples/",
+    "index.js",
+    "index.d.ts",
     "README.md",
     "LICENSE"
   ],
   "devDependencies": {
     "@eslint/js": "^9.31.0",
     "cpy-cli": "^5.0.0",
-    "eslint": "^9.31.0"
+    "eslint": "^9.31.0",
+    "@types/node": "^20.0.0",
+    "typescript": "^5.0.0"
   }
 }

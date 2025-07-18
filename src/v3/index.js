@@ -16,10 +16,36 @@ const defaultConfig = {
 // 缓存存储
 const cache = new Map();
 
-// 拦截器
+// 增强的拦截器系统
+class InterceptorManager {
+  constructor() {
+    this.handlers = [];
+  }
+
+  use(fulfilled, rejected) {
+    this.handlers.push({ fulfilled, rejected });
+    return this.handlers.length - 1;
+  }
+
+  eject(id) {
+    if (this.handlers[id]) {
+      this.handlers[id] = null;
+    }
+  }
+
+  async forEach(fn) {
+    for (let i = 0; i < this.handlers.length; i++) {
+      if (this.handlers[i] !== null) {
+        await fn(this.handlers[i]);
+      }
+    }
+  }
+}
+
+// 拦截器实例
 const interceptors = {
-  request: [],
-  response: []
+  request: new InterceptorManager(),
+  response: new InterceptorManager()
 };
 
 // checkPort 函数定义
@@ -37,26 +63,75 @@ async function checkPort(host, port) {
   });
 }
 
+// 请求去重管理器
+class RequestDeduplicator {
+  constructor() {
+    this.pendingRequests = new Map();
+  }
+
+  getKey(url, options) {
+    return `${options.method || 'GET'}:${url}:${JSON.stringify(options.body || '')}`;
+  }
+
+  async deduplicate(url, options, requestFn) {
+    const key = this.getKey(url, options);
+    
+    if (this.pendingRequests.has(key)) {
+      return this.pendingRequests.get(key);
+    }
+
+    const promise = requestFn().finally(() => {
+      this.pendingRequests.delete(key);
+    });
+
+    this.pendingRequests.set(key, promise);
+    return promise;
+  }
+}
+
+const requestDeduplicator = new RequestDeduplicator();
+
 class LiteFetchV3 {
   constructor(config = {}) {
     this.config = { ...defaultConfig, ...config };
+    this.interceptors = {
+      request: new InterceptorManager(),
+      response: new InterceptorManager()
+    };
   }
 
-  // 添加请求拦截器
+  // 添加请求拦截器（兼容旧版本）
   addRequestInterceptor(interceptor) {
-    interceptors.request.push(interceptor);
-    return interceptors.request.length - 1;
+    return this.interceptors.request.use(interceptor);
   }
 
-  // 添加响应拦截器
+  // 添加响应拦截器（兼容旧版本）
   addResponseInterceptor(interceptor) {
-    interceptors.response.push(interceptor);
-    return interceptors.response.length - 1;
+    return this.interceptors.response.use(interceptor);
   }
 
-  // 核心请求方法 (支持 AbortController)
+  // 移除拦截器
+  removeRequestInterceptor(id) {
+    this.interceptors.request.eject(id);
+  }
+
+  removeResponseInterceptor(id) {
+    this.interceptors.response.eject(id);
+  }
+
+  // 核心请求方法 (支持 AbortController 和请求去重)
   async request(url, options = {}) {
     const config = { ...this.config, ...options };
+    
+    // 请求去重
+    if (config.deduplicate !== false) {
+      return requestDeduplicator.deduplicate(url, config, () => this._makeRequest(url, config));
+    }
+    
+    return this._makeRequest(url, config);
+  }
+
+  async _makeRequest(url, config) {
     const parsedUrl = new URL(url);
     const port = parsedUrl.port || (parsedUrl.protocol === 'https:' ? 443 : 80);
     
@@ -66,7 +141,7 @@ class LiteFetchV3 {
       throw new Error(`Port ${port} on ${parsedUrl.hostname} is not open`);
     }
     
-    const cacheKey = `${config.method || 'GET'}:${url}`; // 生成缓存键
+    const cacheKey = `${config.method || 'GET'}:${url}`;
     
     // 检查缓存
     if (config.cache) {
@@ -91,14 +166,24 @@ class LiteFetchV3 {
         };
         
         // 执行请求拦截器
-        for (const interceptor of interceptors.request) {
-          fetchOptions = await interceptor(fetchOptions) || fetchOptions;
-        }
+        await this.interceptors.request.forEach(async (handler) => {
+          if (handler.fulfilled) {
+            try {
+              fetchOptions = await handler.fulfilled(fetchOptions) || fetchOptions;
+            } catch (error) {
+              if (handler.rejected) {
+                fetchOptions = await handler.rejected(error) || fetchOptions;
+              } else {
+                throw error;
+              }
+            }
+          }
+        });
 
         if (config.body) {
           if (config.body instanceof FormData) {
             fetchOptions.body = config.body;
-            delete fetchOptions.headers['Content-Type']; // FormData 会自动设置
+            delete fetchOptions.headers['Content-Type'];
           } else if (typeof config.body === 'object') {
             fetchOptions.body = JSON.stringify(config.body);
           } else {
@@ -124,19 +209,29 @@ class LiteFetchV3 {
           data = await response.buffer();
         }
 
-        // 缓存响应
-        if (config.cache) {
-          cache.set(cacheKey, { data: { data, status: response.status, statusText: response.statusText, headers: response.headers }, timestamp: Date.now() });
-        }
-
         let result = { data, status: response.status, statusText: response.statusText, headers: response.headers };
 
         // 执行响应拦截器
-        for (const interceptor of interceptors.response) {
-          result = await interceptor(result) || result;
+        await this.interceptors.response.forEach(async (handler) => {
+          if (handler.fulfilled) {
+            try {
+              result = await handler.fulfilled(result) || result;
+            } catch (error) {
+              if (handler.rejected) {
+                result = await handler.rejected(error) || result;
+              } else {
+                throw error;
+              }
+            }
+          }
+        });
+
+        // 缓存响应
+        if (config.cache) {
+          cache.set(cacheKey, { data: result, timestamp: Date.now() });
         }
 
-        return { data, status: response.status, statusText: response.statusText, headers: response.headers };
+        return result;
       } catch (error) {
         lastError = error;
         
@@ -167,12 +262,25 @@ class LiteFetchV3 {
   async delete(url, options = {}) {
     return this.request(url, { ...options, method: 'DELETE' });
   }
+
+  // 批量请求
+  async all(requests) {
+    return Promise.all(requests.map(req => 
+      typeof req === 'string' ? this.get(req) : this.request(req.url, req.options)
+    ));
+  }
+
+  // 竞速请求
+  async race(requests) {
+    return Promise.race(requests.map(req => 
+      typeof req === 'string' ? this.get(req) : this.request(req.url, req.options)
+    ));
+  }
 }
 
 // 创建默认实例
 const litefetch = new LiteFetchV3();
 
-// 导出
 // 导出
 export default litefetch;
 export const get = litefetch.get.bind(litefetch);
